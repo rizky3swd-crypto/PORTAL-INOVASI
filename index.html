@@ -1,0 +1,146 @@
+# PORTAL-INOVASI
+/**
+ * BACKEND PORTAL PENDUDUK & PENGAJUAN SURAT
+ * Tempel di Apps Script (Code.gs). File HTML frontend harus diberi nama "index".
+ * Script ini harus dibuat dari Google Sheets: Extensions > Apps Script.
+ */
+
+const SHEET_PENDUDUK = 'Penduduk';
+const SHEET_PENGAJUAN = 'Pengajuan';
+
+const HEADER_PENDUDUK = ['NIK', 'Nama', 'Tempat Lahir', 'Tanggal Lahir', 'Jenis Kelamin',
+  'Alamat', 'RT/RW', 'Agama', 'Status Perkawinan', 'Pekerjaan', 'Telepon'];
+const HEADER_PENGAJUAN = ['ID', 'NIK', 'Nama', 'Jenis Surat', 'Keterangan', 'Tanggal', 'Status'];
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('Portal Layanan Desa')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// Ambil sheet; buat otomatis beserta header jika belum ada
+function getSheet_(name, header) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(header);
+    sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+// Ubah nilai sel jadi string aman (Date tidak bisa dikirim ke browser)
+function str_(v) {
+  if (v instanceof Date) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  return v === null || v === undefined ? '' : String(v);
+}
+
+function apiGetDashboardData() {
+  try {
+    const shP = getSheet_(SHEET_PENDUDUK, HEADER_PENDUDUK);
+    const shR = getSheet_(SHEET_PENGAJUAN, HEADER_PENGAJUAN);
+
+    const dataP = shP.getLastRow() > 1
+      ? shP.getRange(2, 1, shP.getLastRow() - 1, HEADER_PENDUDUK.length).getValues() : [];
+    const dataR = shR.getLastRow() > 1
+      ? shR.getRange(2, 1, shR.getLastRow() - 1, HEADER_PENGAJUAN.length).getValues() : [];
+
+    const residents = dataP.map(r => ({
+      nik: str_(r[0]), nama: str_(r[1]), tempatLahir: str_(r[2]), tanggalLahir: str_(r[3]),
+      jenisKelamin: str_(r[4]), alamat: str_(r[5]), rtRw: str_(r[6]), agama: str_(r[7]),
+      statusPerkawinan: str_(r[8]), pekerjaan: str_(r[9]), telepon: str_(r[10])
+    }));
+
+    const requests = dataR.map(r => ({
+      id: str_(r[0]), nik: str_(r[1]), nama: str_(r[2]), jenisSurat: str_(r[3]),
+      keterangan: str_(r[4]), tanggal: str_(r[5]), status: str_(r[6])
+    })).reverse(); // terbaru di atas
+
+    return {
+      success: true,
+      totalResidents: residents.length,
+      totalRequests: requests.length,
+      pendingRequests: requests.filter(r => r.status === 'Pending').length,
+      residents: residents,
+      requests: requests
+    };
+  } catch (e) {
+    throw new Error(e.message);
+  }
+}
+
+function apiAddResident(f) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const sh = getSheet_(SHEET_PENDUDUK, HEADER_PENDUDUK);
+
+    // Cegah NIK ganda
+    if (sh.getLastRow() > 1) {
+      const niks = sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().flat().map(String);
+      if (niks.indexOf(String(f.nik)) !== -1) {
+        throw new Error('NIK ' + f.nik + ' sudah terdaftar.');
+      }
+    }
+
+    const row = sh.getLastRow() + 1;
+    // Format kolom NIK, RT/RW & Telepon sebagai teks agar angka 0 di depan tidak hilang
+    sh.getRange(row, 1).setNumberFormat('@');
+    sh.getRange(row, 7).setNumberFormat('@');
+    sh.getRange(row, 11).setNumberFormat('@');
+    sh.getRange(row, 4).setNumberFormat('@'); // tanggal lahir disimpan sebagai teks yyyy-MM-dd
+
+    sh.getRange(row, 1, 1, HEADER_PENDUDUK.length).setValues([[
+      f.nik, f.nama, f.tempatLahir, f.tanggalLahir, f.jenisKelamin,
+      f.alamat, f.rtRw, f.agama, f.statusPerkawinan, f.pekerjaan, f.telepon
+    ]]);
+    SpreadsheetApp.flush();
+    return { success: true, message: 'Data penduduk berhasil disimpan!' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function apiSubmitRequest(f) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const sh = getSheet_(SHEET_PENGAJUAN, HEADER_PENGAJUAN);
+    const id = 'REQ-' + (1000 + sh.getLastRow()); // baris 1 = header, jadi REQ-1001 dst.
+    const tanggal = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+    const row = sh.getLastRow() + 1;
+    sh.getRange(row, 2).setNumberFormat('@');
+    sh.getRange(row, 6).setNumberFormat('@');
+    sh.getRange(row, 1, 1, HEADER_PENGAJUAN.length).setValues([[
+      id, f.nik, f.nama, f.jenisSurat, f.keterangan, tanggal, 'Pending'
+    ]]);
+    SpreadsheetApp.flush();
+    return { success: true, message: 'Pengajuan surat berhasil dikirim! ID: ' + id };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function apiUpdateStatusRequest(id, newStatus) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const sh = getSheet_(SHEET_PENGAJUAN, HEADER_PENGAJUAN);
+    if (sh.getLastRow() < 2) throw new Error('Belum ada data pengajuan.');
+
+    const ids = sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().flat().map(String);
+    const idx = ids.indexOf(String(id));
+    if (idx === -1) throw new Error('ID ' + id + ' tidak ditemukan.');
+
+    sh.getRange(idx + 2, 7).setValue(newStatus);
+    SpreadsheetApp.flush();
+    return { success: true, message: 'Status surat ' + id + ' diubah menjadi ' + newStatus };
+  } finally {
+    lock.releaseLock();
+  }
+}
